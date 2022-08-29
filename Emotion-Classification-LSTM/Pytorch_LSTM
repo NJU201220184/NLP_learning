@@ -1,0 +1,226 @@
+import re
+import time
+import ast
+from gensim.models import Word2Vec
+from gensim.models.word2vec import LineSentence
+from gensim.corpora.dictionary import Dictionary
+import jieba
+import matplotlib.pyplot as plt
+import torch.nn as nn
+import torch.utils.data as Data
+import torch
+import numpy as np
+
+def stopwordslist(filepath):  
+    stopwords = [line.strip() for line in open(filepath, 'r', encoding='utf-8').readlines()]  
+    return stopwords
+
+stopwords = stopwordslist("./stopwords.txt")
+
+
+with open('Datasets/train/usual_train.txt') as train_file:
+    train_document = train_file.read()
+with open('Datasets/test/real/usual_test_labeled.txt') as test_file:
+    test_document = test_file.read()
+
+train_list = ast.literal_eval(train_document)
+test_list = ast.literal_eval(test_document)
+
+def clean_data(word_list):
+    for item in word_list:
+        # clean data
+        item['content'] = re.sub(r'\/\/\@.*?(\：|\:)', "", item['content']) # 清除@用户信息
+        item['content'] = re.sub(r'\#.*?\#', "", item['content']) # 清除话题信息
+        item['content'] = re.sub(r'\【.*?\】', "", item['content']) # 清除话题信息
+        item['content'] = re.sub(r'(https|http)?:\/\/(\w|\.|\/|\?|\=|\&|\%)*\b', "", item['content'], flags=re.MULTILINE) # 清除链接信息
+        # transfer label
+        if(item['label']=='neutral'):
+            item['label'] = 0
+        elif(item['label']=='happy'):
+            item['label'] = 1
+        elif(item['label']=='angry'):
+            item['label'] = 2
+        elif(item['label']=='sad'):
+            item['label'] = 3
+        elif(item['label']=='fear'):
+            item['label'] = 4
+        elif(item['label']=='surprise'):
+            item['label'] = 5
+
+clean_data(train_list)
+clean_data(test_list)
+
+def splite_content(data):    
+    string_splite = ''
+    pure_data = []
+    for temp in range(len(data)):
+        content = data[temp]['content']
+        new_content = jieba.cut(content,cut_all=False)
+        str_out = ' '.join(new_content)
+        cop = re.compile("[^\u4e00-\u9fa5^a-z^A-Z^0-9^\s]") # 去除非中英文字、数字的所有字符
+        str_out = cop.sub('', str_out)
+
+        for i in range(6):
+            str_out = str_out.replace('  ',' ') # 去除多余空格
+        str_out = str_out.strip() # 去除两边空格
+
+        data[temp]['content'] = str_out.split(' ')
+        pure_data.append([data[temp]['content'],data[temp]['label']])
+        str_out += '\r\n' 
+        string_splite += str_out
+    return pure_data, string_splite
+
+splite_word_all = '' # 分词总文本(包括训练文本和测试文本)
+data_seg_train, out = splite_content(train_list)
+splite_word_all += out 
+data_seg_test, out = splite_content(test_list)
+splite_word_all += out 
+
+# 保存分好词的文本
+f = open('splite_word_all.txt', 'w', encoding='utf-8')
+f.write(splite_word_all)
+f.close()
+
+'''
+def analyse_word_num(data):
+    data_num_train = len(data) # 数据条数
+    word_num = 0 # 总词数
+    single_num = [] # 每条数据的长度的大小数组
+    ave_num = 0 # 平均每条数据的词数大小
+
+    for i in range(len(data)):
+        single_num.append(len(data[i][0]))
+        word_num += len(data[i][0])
+    ave_num = word_num/data_num_train
+    print('全部数据词总数为：',word_num,'; 每条数据的平均词数为：' ,ave_num)
+    
+    plt.hist(single_num, bins=500)
+    plt.xlabel('Sequence Length')
+    plt.ylabel('Frequency')
+    plt.axis([0,100,0,2500])
+    plt.show()
+    
+analyse_word_num(data_seg_train)
+'''
+
+#模型训练，生成词向量
+model_file_name = 'w2v.model'
+sentences = LineSentence('splite_word_all.txt')
+model = Word2Vec(sentences, vector_size=30, window=20, min_count=5, workers=4) # 参数含义：数据源，生成词向量长度，时间窗大小，最小词频数，线程数
+model.save(model_file_name)
+
+# 使用训练好的模型
+model = Word2Vec.load(model_file_name)
+
+# 创建词语字典
+def create_dictionaries(p_model):
+    gensim_dict = Dictionary()
+    gensim_dict.doc2bow(p_model.wv.index_to_key, allow_update=True)
+    w2indx = {v: k  for k, v in gensim_dict.items()}  # 词语的索引，从0开始编号
+    id2vec = {w2indx.get(word): model.wv.__getitem__(word) for word in w2indx.keys()}  # 词语的词向量
+    return w2indx, id2vec
+
+word_id_dic, id_vect_dic= create_dictionaries(model) # 两个词典的功能：word-> id , id -> vector
+# print('失望对应的id为：',word_id_dic['失望'])
+# print('失望对应的词向量vector为：',id_vect_dic[word_id_dic['失望']])
+
+# token化数据，word->id
+def get_tokenized_imdb(data):
+    """
+    data: list of [list of word , label]
+    
+    """
+    for word_list, label in data:
+        temp = []
+        for word in word_list:
+            if(word in word_id_dic.keys()):
+                temp.append(int(word_id_dic[word]))
+            else:
+                temp.append(0)
+        yield [temp,label]
+
+
+# 对数据进行 截断 和 填充
+def preprocess_imdb(data):
+    max_l = 30  # 将每条微博通过截断或者补1，使得长度变成30
+
+    def pad(x):
+        return x[:max_l] if len(x) > max_l else x + [1] * (max_l - len(x))
+
+    features = torch.tensor([pad(content[0]) for content in data])
+    labels = torch.tensor([score for _, score in data])
+    return features, labels
+
+data_train = preprocess_imdb(list(get_tokenized_imdb(data_seg_train)))
+data_test = preprocess_imdb(list(get_tokenized_imdb(data_seg_test)))
+
+# 加载数据到迭代器，并规定batch 大小
+batch_size = 64
+train_set = Data.TensorDataset(*data_train)  # *表示接受元组类型数组
+train_iter = Data.DataLoader(train_set, batch_size, shuffle=True)
+test_set = Data.TensorDataset(*data_test)  # *表示接受元组类型数组
+test_iter = Data.DataLoader(test_set, batch_size, shuffle=True)
+
+
+class BiRNN(nn.Module):
+    def __init__(self, vocab_num, embed_size, num_hiddens, num_layers):
+        super(BiRNN, self).__init__()
+        self.embedding = nn.Embedding(vocab_num, embed_size)
+        # bidirectional设为True即得到双向循环神经网络
+        self.encoder = nn.LSTM(input_size=embed_size, 
+                                hidden_size=num_hiddens, 
+                                num_layers=num_layers,
+                                bidirectional=True)
+        # 初始时间步和最终时间步的隐藏状态作为全连接层输入
+        self.decoder = nn.Linear(4*num_hiddens, 6)
+
+    def forward(self, inputs):
+        # inputs的形状是(批量大小, 词数)，因为LSTM需要将序列长度(seq_len)作为第一维，所以将输入转置后
+        # 再提取词特征，输出形状为(词数, 批量大小, 词向量维度)
+        embeddings = self.embedding(inputs.permute(1, 0))
+        # rnn.LSTM只传入输入embeddings，因此只返回最后一层的隐藏层在各时间步的隐藏状态。
+        # outputs形状是(词数, 批量大小, 2 * 隐藏单元个数)
+        outputs, _ = self.encoder(embeddings) # output, (h, c)
+        # 连结初始时间步和最终时间步的隐藏状态作为全连接层输入。它的形状为
+        # (批量大小, 4 * 隐藏单元个数)。
+        encoding = torch.cat((outputs[0], outputs[-1]), -1)
+        outs = self.decoder(encoding)
+        return outs
+
+vocab_num = len(model.wv.index_to_key)
+embed_size, num_hiddens, num_layers = 30, 60, 6
+net = BiRNN(vocab_num, embed_size, num_hiddens, num_layers)
+
+
+
+# 将训练好的词向量输入embedding
+id_vect = torch.Tensor(list(id_vect_dic.values()))
+net.embedding.weight.data.copy_(id_vect)
+net.embedding.weight.requires_grad = False # 直接加载预训练好的, 所以不需要更新它
+
+
+# 定义优化器、损失函数、学习率、epoch
+lr, num_epochs = 0.01, 10
+# 要过滤掉不计算梯度的embedding参数
+optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr)
+loss = nn.CrossEntropyLoss()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# 训练函数
+def train(train_iter, test_iter, net, loss, optimizer, device, num_epochs):
+    print("training on ", device)
+    for epoch in range(num_epochs):
+        for step, (batch_x, batch_y) in enumerate(train_iter):
+            y_hat = net(batch_x)
+            # 损失
+            l = loss(y_hat, batch_y) 
+            # 每一轮初始置0
+            optimizer.zero_grad()
+            # 反向传播
+            l.backward()
+            optimizer.step()
+            print('Epoch:',epoch, '|Step:',step,'|batch x:',batch_x.numpy(),'|batch y:',batch_y.numpy() )
+
+
+train(train_iter, test_iter, net, loss, optimizer, device, num_epochs)
